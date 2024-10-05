@@ -82,7 +82,20 @@ def evaluate(data, model):
 class POSTagger():
     def __init__(self):
         """Initializes the tagger model parameters and anything else necessary. """
-        pass
+        self.data = None
+        self.all_tags = None
+        self.tag2idx = None
+        self.idx2tag = None
+        self.word2idx = None
+        self.idx2word = None
+        self.unigrams = None
+        self.bigrams = None
+        self.trigrams = None
+        self.emissions = None
+        
+        # Hyperparameters
+        self.smoothing_factor = 1e-5  # for add-k smoothing
+        self.unk_token = '<UNK>'
     
     
     def get_unigrams(self):
@@ -90,8 +103,11 @@ class POSTagger():
         Computes unigrams. 
         Tip. Map each tag to an integer and store the unigrams in a numpy array. 
         """
-        ## TODO
-        pass
+        unigrams = np.zeros(len(self.all_tags))
+        for sentence in self.data[1]:
+            for tag in sentence:
+                unigrams[self.tag2idx[tag]] += 1
+        return unigrams / np.sum(unigrams)
 
     def get_bigrams(self):        
         """
@@ -99,17 +115,24 @@ class POSTagger():
         Tip. Map each tag to an integer and store the bigrams in a numpy array
              such that bigrams[index[tag1], index[tag2]] = Prob(tag2|tag1). 
         """
-        ## TODO
-        pass
+        bigrams = np.zeros((len(self.all_tags), len(self.all_tags)))
+        for sentence in self.data[1]:
+            for i in range(len(sentence) - 1):
+                bigrams[self.tag2idx[sentence[i]], self.tag2idx[sentence[i+1]]] += 1
+        return (bigrams + self.smoothing_factor) / (np.sum(bigrams, axis=1, keepdims=True) + self.smoothing_factor * len(self.all_tags))
+
     
     def get_trigrams(self):
         """
         Computes trigrams. 
         Tip. Similar logic to unigrams and bigrams. Store in numpy array. 
         """
-        ## TODO
-        pass
-    
+        trigrams = np.zeros((len(self.all_tags), len(self.all_tags), len(self.all_tags)))
+        for sentence in self.data[1]:
+            for i in range(len(sentence) - 2):
+                trigrams[self.tag2idx[sentence[i]], self.tag2idx[sentence[i+1]], self.tag2idx[sentence[i+2]]] += 1
+        return (trigrams + self.smoothing_factor) / (np.sum(trigrams, axis=2, keepdims=True) + self.smoothing_factor * len(self.all_tags))
+
     
     def get_emissions(self):
         """
@@ -117,8 +140,11 @@ class POSTagger():
         Tip. Map each tag to an integer and each word in the vocabulary to an integer. 
              Then create a numpy array such that lexical[index(tag), index(word)] = Prob(word|tag) 
         """
-        ## TODO
-        pass  
+        emissions = np.zeros((len(self.all_tags), len(self.word2idx)))
+        for sentence, tags in zip(self.data[0], self.data[1]):
+            for word, tag in zip(sentence, tags):
+                emissions[self.tag2idx[tag], self.word2idx[word]] += 1
+        return (emissions + self.smoothing_factor) / (np.sum(emissions, axis=1, keepdims=True) + self.smoothing_factor * len(self.word2idx)) 
     
 
     def train(self, data):
@@ -133,15 +159,31 @@ class POSTagger():
         self.all_tags = list(set([t for tag in data[1] for t in tag]))
         self.tag2idx = {self.all_tags[i]:i for i in range(len(self.all_tags))}
         self.idx2tag = {v:k for k,v in self.tag2idx.items()}
-        ## TODO
-        pass
+        
+        all_words = set([w for sentence in data[0] for w in sentence])
+        all_words.add(self.unk_token)
+        self.word2idx = {word: idx for idx, word in enumerate(all_words)}
+        self.idx2word = {v:k for k,v in self.word2idx.items()}
+        
+        self.unigrams = self.get_unigrams()
+        self.bigrams = self.get_bigrams()
+        self.trigrams = self.get_trigrams()
+        self.emissions = self.get_emissions()
 
     def sequence_probability(self, sequence, tags):
         """Computes the probability of a tagged sequence given the emission/transition
         probabilities.
         """
-        ## TODO
-        return 0.
+        prob = 1.0
+        for i in range(len(sequence)):
+            if i == 0:
+                prob *= self.unigrams[self.tag2idx[tags[i]]]
+            elif i == 1:
+                prob *= self.bigrams[self.tag2idx[tags[i-1]], self.tag2idx[tags[i]]]
+            else:
+                prob *= self.trigrams[self.tag2idx[tags[i-2]], self.tag2idx[tags[i-1]], self.tag2idx[tags[i]]]
+            prob *= self.emissions[self.tag2idx[tags[i]], self.word2idx.get(sequence[i], self.word2idx[self.unk_token])]
+        return prob
 
     def inference(self, sequence):
         """Tags a sequence with part of speech tags.
@@ -155,7 +197,39 @@ class POSTagger():
         """
         ## TODO
         return []
+    
+    def greedy_decode(self, sequence):
+        """Performs greedy decoding."""
+        tags = []
+        for word in sequence:
+            best_tag = max(self.all_tags, key=lambda tag: self.emissions[self.tag2idx[tag], self.word2idx.get(word, self.word2idx[self.unk_token])])
+            tags.append(best_tag)
+        return tags
 
+    def viterbi_decode(self, sequence):
+        """Performs Viterbi decoding."""
+        V = [{}]
+        path = {}
+        
+        # Initialize base cases (t == 0)
+        for tag in self.all_tags:
+            V[0][tag] = self.unigrams[self.tag2idx[tag]] * self.emissions[self.tag2idx[tag], self.word2idx.get(sequence[0], self.word2idx[self.unk_token])]
+            path[tag] = [tag]
+        
+        # Run Viterbi for t > 0
+        for t in range(1, len(sequence)):
+            V.append({})
+            newpath = {}
+            for tag in self.all_tags:
+                (prob, state) = max((V[t-1][prev_tag] * self.bigrams[self.tag2idx[prev_tag], self.tag2idx[tag]] * 
+                                     self.emissions[self.tag2idx[tag], self.word2idx.get(sequence[t], self.word2idx[self.unk_token])], prev_tag) 
+                                    for prev_tag in self.all_tags)
+                V[t][tag] = prob
+                newpath[tag] = path[state] + [tag]
+            path = newpath
+        
+        (prob, state) = max((V[len(sequence) - 1][tag], tag) for tag in self.all_tags)
+        return path[state]
 
 if __name__ == "__main__":
     pos_tagger = POSTagger()
