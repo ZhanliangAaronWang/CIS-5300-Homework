@@ -90,12 +90,24 @@ class POSTagger:
         self.vocab_size = -1
         self.punct_set = frozenset(string.punctuation)
         self.suffix_dict = {
-            'noun': frozenset(["action", "age", "ance", "cy", "dom", "ee", "ence", "er", "hood", "ion", "ism", "ist", "ity", "ling", "ment", "ness", "or", "ry", "scape", "ship", "ty"]),
-            'verb': frozenset(["ate", "ify", "ise", "ize"]),
-            'adj': frozenset(["able", "ese", "ful", "i", "ian", "ible", "ic", "ish", "ive", "less", "ly", "ous"]),
-            'adv': frozenset(["ward", "wards", "wise"])
+            'noun': frozenset([
+                "action", "age", "ance", "cy", "dom", "ee", "ence", "er", "hood", "ion", "ism", "ist", "ity", "ling", 
+                "ment", "ness", "or", "ry", "scape", "ship", "ty", "sion", "tion", "ure", "ism", "ance", "ence", "ology", 
+                "phobia", "logy", "ment", "ship", "ness", "ation"
+            ]),
+            'verb': frozenset([
+                "ate", "ify", "ise", "ize", "en", "esce", "ed", "ing", "ise", "ize", "ify", "ate"
+            ]),
+            'adj': frozenset([
+                "able", "ese", "ful", "i", "ian", "ible", "ic", "ish", "ive", "less", "ly", "ous", "al", "ent", "ant", "y",
+                "ical", "ous", "ive", "ible", "able", "ian", "en", "ese", "ward", "ant", "ent", "ous", "y", "ive", "al", 
+                "ish"
+            ]),
+            'adv': frozenset([
+                "ward", "wards", "wise", "ly", "ally"
+            ])
         }
-        self.epsilon = 1e-10
+        self.epsilon = 1e-100
     def get_unigrams(self) -> None:
         self.uni = np.array([sum(x.count(tag) for x in self.tag_data) / self.vocab_size for tag in self.tag_set])
 
@@ -132,7 +144,7 @@ class POSTagger:
                         bi[i, j] += (discount / context_counts[i]) * (continuation_counts[j] / len(self.tag_set))
         elif self.smoothing_method == LAPLACE:
             for i in range(len(bi)):
-                bi[i] += np.exp(np.log(LAPLACE_FACTOR) - np.log(len(self.tag_set)) - np.log(self.uni[i] * self.vocab_size + LAPLACE_FACTOR))
+                bi[i] += np.exp(self.epsilon+np.log(self.epsilon+LAPLACE_FACTOR) - np.log(self.epsilon+len(self.tag_set)) - np.log(self.epsilon+self.uni[i] * self.vocab_size + LAPLACE_FACTOR))
         elif self.smoothing_method == INTERPOLATION:
             lambda_1, lambda_2 = BIGRAM_LAMBDAS
             bi = lambda_1 * bi + lambda_2 * self.uni[:, np.newaxis]
@@ -179,7 +191,7 @@ class POSTagger:
                             if normalization > 0:
                                 tri[i, j, k] += (discount / bigram_counts[i, j]) * (continuation_counts[j, k] / normalization)
         elif self.smoothing_method == LAPLACE:
-            tri = np.exp(np.log(tri + LAPLACE_FACTOR/len(self.tag_set)) - np.log(bi_denoms[:,:,None] + LAPLACE_FACTOR))
+            tri = np.exp(np.log(self.epsilon+tri + LAPLACE_FACTOR/len(self.tag_set)) - np.log(self.epsilon+bi_denoms[:,:,None] + LAPLACE_FACTOR))
         elif self.smoothing_method == INTERPOLATION:
             lambda_1, lambda_2, lambda_3 = TRIGRAM_LAMBDAS
             for i in range(len(tri)):
@@ -195,7 +207,7 @@ class POSTagger:
         
         self.tri = tri
 
-    def assign_unk(self, tok: str) -> str:
+    def assign_unk(self, tok: str, UNK_M: int = 3) -> str:
         if any(c.isdigit() for c in tok):
             return "--unk_digit--"
         if any(c in self.punct_set for c in tok):
@@ -203,7 +215,7 @@ class POSTagger:
         if any(c.isupper() for c in tok):
             return "--unk_upper--"
         for pos, suffixes in self.suffix_dict.items():
-            if any(tok.endswith(suffix) for suffix in suffixes):
+            if any(tok.endswith(suffix[-UNK_M:]) for suffix in suffixes):
                 return f"--unk_{pos}--"
         return "--unk--"
 
@@ -217,15 +229,23 @@ class POSTagger:
         tag_sums = np.sum(lex, axis=1, keepdims=True)
         self.lex = (lex + 1) / (tag_sums + len(self.word_set))
 
-    def train(self, data: Tuple[List[List[str]], List[List[str]]], ngram: int = 2) -> None:
+    def train(self, data: Tuple[List[List[str]], List[List[str]]], ngram: int = 2, UNK_C=2, UNK_M=3) -> None:
         self.word_data, self.tag_data = data
         self.tag_set = list(set(tag for sent in self.tag_data for tag in sent))
         self.tag2idx = {tag: i for i, tag in enumerate(self.tag_set)}
         self.idx2tag = {i: tag for tag, i in self.tag2idx.items()}
 
+        word_count = defaultdict(int)
+        for sent in self.word_data:
+            for word in sent:
+                word_count[word] += 1
+
         unk_types = ["--unk--", "--unk_digit--", "--unk_punct--", "--unk_upper--", 
-                     "--unk_noun--", "--unk_verb--", "--unk_adj--", "--unk_adv--"]
-        self.word_set = list(set(word for sent in self.word_data for word in sent) | set(unk_types))
+                    "--unk_noun--", "--unk_verb--", "--unk_adj--", "--unk_adv--"]
+        self.word_set = list(set(word for sent in self.word_data for word in sent if word_count[word] >= UNK_C) | set(unk_types))
+        
+        self.word_data = [[word if word_count[word] >= UNK_C else self.assign_unk(word) for word in sent] for sent in self.word_data]
+        
         self.word2idx = {word: i for i, word in enumerate(self.word_set)}
         self.idx2word = {i: word for word, i in self.word2idx.items()}
         self.vocab_size = sum(len(d) for d in self.word_data)
@@ -244,13 +264,13 @@ class POSTagger:
         prev2, prev1 = None, None
         for tag, word in zip(tags, sequence):
             word = self.assign_unk(word) if word not in self.word2idx else word
-            log_prob += np.log(self.lex[self.tag2idx[tag], self.word2idx[word]])
+            log_prob += np.log(self.epsilon+self.lex[self.tag2idx[tag], self.word2idx[word]])
             if self.n_gram == 1:
-                log_prob += np.log(self.uni[self.tag2idx[tag]])
+                log_prob += np.log(self.epsilon+self.uni[self.tag2idx[tag]])
             elif self.n_gram == 2 and prev1:
-                log_prob += np.log(self.bi[self.tag2idx[prev1], self.tag2idx[tag]])
+                log_prob += np.log(self.epsilon+self.bi[self.tag2idx[prev1], self.tag2idx[tag]])
             elif self.n_gram == 3 and prev2 and prev1:
-                log_prob += np.log(self.tri[self.tag2idx[prev2], self.tag2idx[prev1], self.tag2idx[tag]])
+                log_prob += np.log(self.epsilon+self.tri[self.tag2idx[prev2], self.tag2idx[prev1], self.tag2idx[tag]])
             prev2, prev1 = prev1, tag
         return np.exp(log_prob)
 
@@ -315,7 +335,7 @@ class POSTagger:
                 prev2 = tags[-2] if len(tags) >= 2 else None
                 for tag in self.get_beam_search_best_tag(word, prev1, prev2):
                     new_tags = tags + [tag]
-                    new_score = score + np.log(self.sequence_probability(sequence[:i+1], new_tags))
+                    new_score = score + np.log(self.epsilon+self.sequence_probability(sequence[:i+1], new_tags))
                     new_beam.append((new_tags, new_score))
             beam = sorted(new_beam, key=lambda x: x[1], reverse=True)[:BEAM_K]
         return beam[0][0]
@@ -332,7 +352,7 @@ class POSTagger:
         path = {}
         for tag in self.tag_set:
             word = self.assign_unk(sequence[0]) if sequence[0] not in self.word2idx else sequence[0]
-            V[0][tag] = np.log(self.uni[self.tag2idx[tag]] + self.epsilon) + np.log(self.lex[self.tag2idx[tag], self.word2idx[word]] + self.epsilon)
+            V[0][tag] = np.log(self.epsilon+self.uni[self.tag2idx[tag]] + self.epsilon) + np.log(self.epsilon+self.lex[self.tag2idx[tag], self.word2idx[word]] + self.epsilon)
             path[tag] = [tag]
         
         for t in range(1, len(sequence)):
@@ -342,7 +362,7 @@ class POSTagger:
                 word = self.assign_unk(sequence[t]) if sequence[t] not in self.word2idx else sequence[t]
                 word_idx = self.word2idx[word]
                 (prob, state) = max(
-                    (V[t-1][y0] + np.log(self.bi[self.tag2idx[y0], self.tag2idx[tag]] + self.epsilon) + np.log(self.lex[self.tag2idx[tag], word_idx] + self.epsilon), y0)
+                    (V[t-1][y0] + np.log(self.epsilon+self.bi[self.tag2idx[y0], self.tag2idx[tag]] + self.epsilon) + np.log(self.epsilon+self.lex[self.tag2idx[tag], word_idx] + self.epsilon), y0)
                     for y0 in self.tag_set
                 )
                 V[t][tag] = prob
@@ -357,7 +377,7 @@ class POSTagger:
         path = {}
         for tag in self.tag_set:
             word = self.assign_unk(sequence[0]) if sequence[0] not in self.word2idx else sequence[0]
-            V[0][tag] = np.log(self.uni[self.tag2idx[tag]] + self.epsilon) + np.log(self.lex[self.tag2idx[tag], self.word2idx[word]] + self.epsilon)
+            V[0][tag] = np.log(self.epsilon+self.uni[self.tag2idx[tag]] + self.epsilon) + np.log(self.epsilon+self.lex[self.tag2idx[tag], self.word2idx[word]] + self.epsilon)
             path[tag] = [tag]
         
         for t in range(1, len(sequence)):
@@ -368,12 +388,12 @@ class POSTagger:
                 word_idx = self.word2idx[word]
                 if t == 1:
                     (prob, state) = max(
-                        (V[t-1][y0] + np.log(self.bi[self.tag2idx[y0], self.tag2idx[tag]] + self.epsilon) + np.log(self.lex[self.tag2idx[tag], word_idx] + self.epsilon), y0)
+                        (V[t-1][y0] + np.log(self.epsilon+self.bi[self.tag2idx[y0], self.tag2idx[tag]] + self.epsilon) + np.log(self.epsilon+self.lex[self.tag2idx[tag], word_idx] + self.epsilon), y0)
                         for y0 in self.tag_set
                     )
                 else:
                     (prob, state) = max(
-                        (V[t-1][y0] + np.log(self.tri[self.tag2idx[path[y0][-2]], self.tag2idx[y0], self.tag2idx[tag]] + self.epsilon) + np.log(self.lex[self.tag2idx[tag], word_idx] + self.epsilon), y0)
+                        (V[t-1][y0] + np.log(self.epsilon+self.tri[self.tag2idx[path[y0][-2]], self.tag2idx[y0], self.tag2idx[tag]] + self.epsilon) + np.log(self.epsilon+self.lex[self.tag2idx[tag], word_idx] + self.epsilon), y0)
                         for y0 in self.tag_set
                     )
                 V[t][tag] = prob
@@ -394,13 +414,13 @@ class POSTagger:
         return method_map[self.inference_method](sequence)
 
 if __name__ == "__main__":
-    pos_tagger = POSTagger(VITERBI, smoothing_method="kneser_ney")
+    pos_tagger = POSTagger(VITERBI, smoothing_method=INTERPOLATION)
 
     train_data = load_data("data/train_x.csv", "data/train_y.csv")
     dev_data = load_data("data/dev_x.csv", "data/dev_y.csv")
     test_data = load_data("data/test_x.csv")
-
-    pos_tagger.train(train_data, ngram=3)
+    # train_data = tuple([a + b for a, b in zip(train_data, dev_data)])
+    pos_tagger.train(train_data, ngram=3, UNK_C=UNK_C, UNK_M=UNK_M)
 
     # Experiment with your decoder using greedy decoding, beam search, viterbi...
 
@@ -418,7 +438,7 @@ if __name__ == "__main__":
     with open('test_y.csv', mode='w', newline='') as file:
         writer = csv.writer(file)
         # Optionally write a header
-        writer.writerow(["id","predicted_tag"])
+        writer.writerow(["id","tag"])
         for i, tag in enumerate(test_predictions):
             writer.writerow([i,tag])
 
