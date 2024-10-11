@@ -2,7 +2,7 @@ from multiprocessing import Pool
 import numpy as np
 import time
 from tagger_utils import *
-
+import csv
 def evaluate(data, model):
     """Evaluates the POS model on some sentences and gold tags.
 
@@ -83,6 +83,7 @@ class POSTagger:
     def __init__(self, inference_method: str, smoothing_method: str = None) -> None:
         self.smoothing_method = smoothing_method
         self.inference_method = inference_method
+        self.discount = 0.75 
         self.uni, self.bi, self.tri = None, None, None
         self.lex = None
         self.n_gram = None
@@ -94,7 +95,7 @@ class POSTagger:
             'adj': frozenset(["able", "ese", "ful", "i", "ian", "ible", "ic", "ish", "ive", "less", "ly", "ous"]),
             'adv': frozenset(["ward", "wards", "wise"])
         }
-
+        self.epsilon = 1e-10
     def get_unigrams(self) -> None:
         self.uni = np.array([sum(x.count(tag) for x in self.tag_data) / self.vocab_size for tag in self.tag_set])
 
@@ -104,43 +105,93 @@ class POSTagger:
     def get_bigrams(self) -> None:
         if self.uni is None:
             self.get_unigrams()
+        
         bi = np.zeros((len(self.tag_set), len(self.tag_set)))
+        
+        if self.smoothing_method == "kneser_ney":
+            context_counts = np.zeros(len(self.tag_set))
+            continuation_counts = np.zeros(len(self.tag_set))
         
         for doc in self.tag_data:
             for curr, next_ in zip(doc, doc[1:]):
-                factor = LAPLACE_FACTOR if self.smoothing_method == LAPLACE else 1
-                bi[self.tag2idx[curr], self.tag2idx[next_]] += 1 / (factor + self.uni[self.tag2idx[curr]] * self.vocab_size)
+                curr_idx, next_idx = self.tag2idx[curr], self.tag2idx[next_]
+                if self.smoothing_method == "kneser_ney":
+                    bi[curr_idx, next_idx] += 1
+                    context_counts[curr_idx] += 1
+                    continuation_counts[next_idx] += 1
+                else:
+                    factor = LAPLACE_FACTOR if self.smoothing_method == LAPLACE else 1
+                    bi[curr_idx, next_idx] += 1 / (factor + self.uni[curr_idx] * self.vocab_size)
         
-        if self.smoothing_method == LAPLACE:
+        if self.smoothing_method == "kneser_ney":
+            discount = 0.75  
+            for i in range(len(self.tag_set)):
+                for j in range(len(self.tag_set)):
+                    if context_counts[i] > 0:
+                        bi[i, j] = max(bi[i, j] - discount, 0) / context_counts[i]
+                        bi[i, j] += (discount / context_counts[i]) * (continuation_counts[j] / len(self.tag_set))
+        elif self.smoothing_method == LAPLACE:
             for i in range(len(bi)):
                 bi[i] += np.exp(np.log(LAPLACE_FACTOR) - np.log(len(self.tag_set)) - np.log(self.uni[i] * self.vocab_size + LAPLACE_FACTOR))
         elif self.smoothing_method == INTERPOLATION:
             lambda_1, lambda_2 = BIGRAM_LAMBDAS
-            bi = lambda_1 * bi + lambda_2 * self.uni
+            bi = lambda_1 * bi + lambda_2 * self.uni[:, np.newaxis]
+        
+        # Normalize
+        row_sums = bi.sum(axis=1)
+        bi = bi / row_sums[:, np.newaxis]
         
         self.bi = bi
-    
+        
     def get_trigrams(self) -> None:
         if self.bi is None:
             self.get_bigrams()
+        
         tri = np.zeros((len(self.tag_set), len(self.tag_set), len(self.tag_set)))
-        bi_denoms = np.zeros((len(self.tag_set), len(self.tag_set)))
+        
+        if self.smoothing_method == "kneser_ney":
+            bigram_counts = np.zeros((len(self.tag_set), len(self.tag_set)))
+            continuation_counts = np.zeros((len(self.tag_set), len(self.tag_set)))
+        elif self.smoothing_method == LAPLACE:
+            bi_denoms = np.zeros((len(self.tag_set), len(self.tag_set)))
         
         for doc in self.tag_data:
             for t1, t2, t3 in zip(doc, doc[1:], doc[2:]):
-                if self.smoothing_method == LAPLACE:
-                    tri[self.tag2idx[t1], self.tag2idx[t2], self.tag2idx[t3]] += 1 
-                    bi_denoms[self.tag2idx[t1], self.tag2idx[t2]] += 1
+                idx1, idx2, idx3 = self.tag2idx[t1], self.tag2idx[t2], self.tag2idx[t3]
+                if self.smoothing_method == "kneser_ney":
+                    tri[idx1, idx2, idx3] += 1
+                    bigram_counts[idx1, idx2] += 1
+                    continuation_counts[idx2, idx3] += 1
+                elif self.smoothing_method == LAPLACE:
+                    tri[idx1, idx2, idx3] += 1 
+                    bi_denoms[idx1, idx2] += 1
                 else: 
-                    tri[self.tag2idx[t1], self.tag2idx[t2], self.tag2idx[t3]] += 1 / (self.bi[self.tag2idx[t1], self.tag2idx[t2]] * self.uni[self.tag2idx[t1]] * self.vocab_size)
+                    tri[idx1, idx2, idx3] += 1 / (self.bi[idx1, idx2] * self.uni[idx1] * self.vocab_size)
         
-        if self.smoothing_method == LAPLACE:
+        if self.smoothing_method == "kneser_ney":
+            discount = 0.75  
+            for i in range(len(self.tag_set)):
+                for j in range(len(self.tag_set)):
+                    if bigram_counts[i, j] > 0:
+                        normalization = np.sum(continuation_counts[j, :])
+                        for k in range(len(self.tag_set)):
+                            tri[i, j, k] = max(tri[i, j, k] - discount, 0) / bigram_counts[i, j]
+                            if normalization > 0:
+                                tri[i, j, k] += (discount / bigram_counts[i, j]) * (continuation_counts[j, k] / normalization)
+        elif self.smoothing_method == LAPLACE:
             tri = np.exp(np.log(tri + LAPLACE_FACTOR/len(self.tag_set)) - np.log(bi_denoms[:,:,None] + LAPLACE_FACTOR))
         elif self.smoothing_method == INTERPOLATION:
             lambda_1, lambda_2, lambda_3 = TRIGRAM_LAMBDAS
             for i in range(len(tri)):
                 for j in range(len(tri[i])):
                     tri[i,j] = lambda_1 * tri[i,j] + lambda_2 * self.bi[j] + lambda_3 * self.uni
+        
+        # Normalize
+        for i in range(len(self.tag_set)):
+            for j in range(len(self.tag_set)):
+                row_sum = np.sum(tri[i, j, :])
+                if row_sum > 0:
+                    tri[i, j, :] /= row_sum
         
         self.tri = tri
 
@@ -280,15 +331,20 @@ class POSTagger:
         V = [{}]
         path = {}
         for tag in self.tag_set:
-            V[0][tag] = np.log(self.uni[self.tag2idx[tag]]) + np.log(self.lex[self.tag2idx[tag], self.word2idx.get(sequence[0], self.word2idx[self.assign_unk(sequence[0])])])
+            word = self.assign_unk(sequence[0]) if sequence[0] not in self.word2idx else sequence[0]
+            V[0][tag] = np.log(self.uni[self.tag2idx[tag]] + self.epsilon) + np.log(self.lex[self.tag2idx[tag], self.word2idx[word]] + self.epsilon)
             path[tag] = [tag]
         
         for t in range(1, len(sequence)):
             V.append({})
             newpath = {}
             for tag in self.tag_set:
-                word_idx = self.word2idx.get(sequence[t], self.word2idx[self.assign_unk(sequence[t])])
-                (prob, state) = max((V[t-1][y0] + np.log(self.bi[self.tag2idx[y0], self.tag2idx[tag]]) + np.log(self.lex[self.tag2idx[tag], word_idx]), y0) for y0 in self.tag_set)
+                word = self.assign_unk(sequence[t]) if sequence[t] not in self.word2idx else sequence[t]
+                word_idx = self.word2idx[word]
+                (prob, state) = max(
+                    (V[t-1][y0] + np.log(self.bi[self.tag2idx[y0], self.tag2idx[tag]] + self.epsilon) + np.log(self.lex[self.tag2idx[tag], word_idx] + self.epsilon), y0)
+                    for y0 in self.tag_set
+                )
                 V[t][tag] = prob
                 newpath[tag] = path[state] + [tag]
             path = newpath
@@ -300,18 +356,26 @@ class POSTagger:
         V = [{}]
         path = {}
         for tag in self.tag_set:
-            V[0][tag] = np.log(self.uni[self.tag2idx[tag]]) + np.log(self.lex[self.tag2idx[tag], self.word2idx.get(sequence[0], self.word2idx[self.assign_unk(sequence[0])])])
+            word = self.assign_unk(sequence[0]) if sequence[0] not in self.word2idx else sequence[0]
+            V[0][tag] = np.log(self.uni[self.tag2idx[tag]] + self.epsilon) + np.log(self.lex[self.tag2idx[tag], self.word2idx[word]] + self.epsilon)
             path[tag] = [tag]
         
         for t in range(1, len(sequence)):
             V.append({})
             newpath = {}
             for tag in self.tag_set:
-                word_idx = self.word2idx.get(sequence[t], self.word2idx[self.assign_unk(sequence[t])])
+                word = self.assign_unk(sequence[t]) if sequence[t] not in self.word2idx else sequence[t]
+                word_idx = self.word2idx[word]
                 if t == 1:
-                    (prob, state) = max((V[t-1][y0] + np.log(self.bi[self.tag2idx[y0], self.tag2idx[tag]]) + np.log(self.lex[self.tag2idx[tag], word_idx]), y0) for y0 in self.tag_set)
+                    (prob, state) = max(
+                        (V[t-1][y0] + np.log(self.bi[self.tag2idx[y0], self.tag2idx[tag]] + self.epsilon) + np.log(self.lex[self.tag2idx[tag], word_idx] + self.epsilon), y0)
+                        for y0 in self.tag_set
+                    )
                 else:
-                    (prob, state) = max((V[t-1][y0] + np.log(self.tri[self.tag2idx[path[y0][-2]], self.tag2idx[y0], self.tag2idx[tag]]) + np.log(self.lex[self.tag2idx[tag], word_idx]), y0) for y0 in self.tag_set)
+                    (prob, state) = max(
+                        (V[t-1][y0] + np.log(self.tri[self.tag2idx[path[y0][-2]], self.tag2idx[y0], self.tag2idx[tag]] + self.epsilon) + np.log(self.lex[self.tag2idx[tag], word_idx] + self.epsilon), y0)
+                        for y0 in self.tag_set
+                    )
                 V[t][tag] = prob
                 newpath[tag] = path[state] + [tag]
             path = newpath
@@ -328,8 +392,9 @@ class POSTagger:
         if self.inference_method not in method_map:
             raise ValueError(f"Unknown inference method: {self.inference_method}")
         return method_map[self.inference_method](sequence)
+
 if __name__ == "__main__":
-    pos_tagger = POSTagger(VITERBI, smoothing_method=LAPLACE)
+    pos_tagger = POSTagger(VITERBI, smoothing_method="kneser_ney")
 
     train_data = load_data("data/train_x.csv", "data/train_y.csv")
     dev_data = load_data("data/dev_x.csv", "data/dev_y.csv")
