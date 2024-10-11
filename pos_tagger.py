@@ -1,12 +1,31 @@
 from multiprocessing import Pool
+from tagger_constants import *
 import numpy as np
 import time
+import string
 from tagger_utils import *
-
-
-
+from itertools import tee
+from pos_tagger_unknown import POSTagger_MLP
+import csv
+import string
+from typing import List, Tuple, Dict
+from itertools import tee
+import numpy as np
 """ Contains the part of speech tagger class. """
 
+def flatten_data(data_words, data_tags):
+    flattened_words = [word for sentence in data_words for word in sentence]
+    flattened_tags = [tag for tag_list in data_tags for tag in tag_list]
+    return flattened_words, flattened_tags
+
+def has_numbers(inputString):
+    return any(char.isdigit() for char in inputString)
+
+def contains_dash(inputString):
+    return '-' in inputString
+
+def is_punctuation(word):
+    return word in string.punctuation
 
 def evaluate(data, model):
     """Evaluates the POS model on some sentences and gold tags.
@@ -22,7 +41,7 @@ def evaluate(data, model):
     As per the write-up, you may find it faster to use multiprocessing (code included). 
     
     """
-    processes = 4
+    processes = 8
     sentences = data[0]
     tags = data[1]
     n = len(sentences)
@@ -57,6 +76,33 @@ def evaluate(data, model):
 
     token_acc = sum([1 for i in range(n) for j in range(len(sentences[i])) if tags[i][j] == predictions[i][j]]) / n_tokens
     unk_token_acc = sum([1 for i in range(n) for j in range(len(sentences[i])) if tags[i][j] == predictions[i][j] and sentences[i][j] not in model.word2idx.keys()]) / unk_n_tokens
+    #adding my manual code
+    misclassification_count = 0
+    for i in range(n):
+        for j in range(len(sentences[i])):
+            # Check if the word is unknown and misclassified
+            if sentences[i][j] not in model.word2idx.keys() and tags[i][j] != predictions[i][j]:
+                print(f"Sentence: {i}, Word: {sentences[i][j]}, Actual Tag: {tags[i][j]}, Predicted Tag: {predictions[i][j]}")
+                misclassification_count += 1
+                # Stop after printing 10 misclassifications
+                if misclassification_count >= 10:
+                    break
+        if misclassification_count >= 10:
+            break
+    print("now look at words that are known but still predicted incorrecly.")
+    misclassification_count = 0 
+    for i in range(n):
+        for j in range(len(sentences[i])):
+            # Check if the word is unknown and misclassified
+            if sentences[i][j] in model.word2idx.keys() and tags[i][j] != predictions[i][j]:
+                print(f"Sentence: {i}, Word: {sentences[i][j]}, Actual Tag: {tags[i][j]}, Predicted Tag: {predictions[i][j]}")
+                misclassification_count += 1
+                # Stop after printing 10 misclassifications
+                if misclassification_count >= 10:
+                    break
+        if misclassification_count >= 10:
+            break
+    #end of manual code
     whole_sent_acc = 0
     num_whole_sent = 0
     for k in range(n):
@@ -78,298 +124,379 @@ def evaluate(data, model):
 
     return whole_sent_acc/num_whole_sent, token_acc, sum(probabilities.values())/n
 
-from tagger_utils import *
-import numpy as np
-from nltk.corpus import wordnet as wn
-import nltk
-nltk.download('wordnet')
-nltk.download('omw-1.4')
 
-import numpy as np
-from multiprocessing import Pool
-import time
-from tagger_utils import *
-from sklearn.neural_network import MLPClassifier
-from nltk.corpus import wordnet as wn
-import nltk
-
-nltk.download('wordnet')
-nltk.download('omw-1.4')
-
-class POSTagger():
-    def __init__(self):
+class POSTagger:
+    def __init__(self, inference_method: str, smoothing_method: str = None) -> None:
         """Initializes the tagger model parameters and anything else necessary."""
-        self.data = None
-        self.all_tags = None
-        self.tag2idx = None
-        self.idx2tag = None
-        self.word2idx = None
-        self.idx2word = None
-        self.unigrams = None
-        self.bigrams = None
-        self.trigrams = None
-        self.emissions = None
-        self.suffix2pos = None  
+        self.smoothing_method: str = smoothing_method
+        self.inference_method: str = inference_method
+        self.unigrams: np.ndarray = None
+        self.bigrams: np.ndarray = None
+        self.trigrams: np.ndarray = None
+        self.lexical: np.ndarray = None
+        self.ngram: int = None
+        self.num_words: int = -1
+        self.punct: set = set(string.punctuation)
+        self.noun_suffix: List[str] = ["action", "age", "ance", "cy", "dom", "ee", "ence", "er", "hood", "ion", "ism", "ist", "ity", "ling", "ment", "ness", "or", "ry", "scape", "ship", "ty"]
+        self.verb_suffix: List[str] = ["ate", "ify", "ise", "ize"]
+        self.adj_suffix: List[str] = ["able", "ese", "ful", "i", "ian", "ible", "ic", "ish", "ive", "less", "ly", "ous"]
+        self.adv_suffix: List[str] = ["ward", "wards", "wise"]
 
-        self.mlp = MLPClassifier(hidden_layer_sizes=(100, 50), max_iter=500)
+    def get_unigrams(self) -> None:
+        """Computes unigrams."""
+        self.unigrams = np.array([sum(x.count(tag) for x in self.data_tags) / self.num_words for tag in self.all_tags])
 
-        # Hyperparameters from the configuration
-        if SMOOTHING == LAPLACE:
-            self.smoothing_factor = LAPLACE_FACTOR 
-        elif SMOOTHING == INTERPOLATION:
-            if LAMBDAS is not None:
-                self.smoothing_factor = LAMBDAS 
-            else:
-                self.smoothing_factor = 0.1  
-        else:
-            self.smoothing_factor = 0  
-        self.unk_token = '<UNK>'
-        self.wordnet_pos_mapping = {
-            'n': 'NOUN',
-            'v': 'VERB',
-            'a': 'ADJ',
-            'r': 'ADV'
-        }
-            
-    def preprocess(self, sentence):
-        """Preprocesses the sentence by converting to lowercase if CAPITALIZATION is set."""
-        if not CAPITALIZATION:
-            return [word.lower() for word in sentence]
-        return sentence
+    def get_unigrams_words(self) -> None:
+        """Computes unigrams for words."""
+        self.unigrams_words = np.array([sum(x.count(word) for x in self.data_words) / self.num_words for word in self.all_words])
 
-    def get_unigrams(self):
-        """Computes unigrams (tag probabilities)."""
-        unigrams = np.zeros(len(self.all_tags))
-        for sentence in self.data[1]:
-            for tag in sentence:
-                unigrams[self.tag2idx[tag]] += 1
-        return (unigrams + EPSILON) / (np.sum(unigrams) + EPSILON)
-
-    def get_bigrams(self):
-        """Computes bigrams (transition probabilities)."""
+    def get_bigrams(self) -> None:
+        """Computes bigrams."""
+        if self.unigrams is None:
+            self.get_unigrams()
         bigrams = np.zeros((len(self.all_tags), len(self.all_tags)))
-        for sentence in self.data[1]:
-            for i in range(len(sentence) - 1):
-                bigrams[self.tag2idx[sentence[i]], self.tag2idx[sentence[i + 1]]] += 1
-        return (bigrams + self.smoothing_factor) / (np.sum(bigrams, axis=1, keepdims=True) + self.smoothing_factor * len(self.all_tags))
-
-    def get_trigrams(self):
-        """Computes trigrams (transition probabilities)."""
+        
+        def pairwise(iterable):
+            """s -> (s0,s1), (s1,s2), (s2, s3), ..."""
+            a, b = tee(iterable)
+            next(b, None)
+            return zip(a, b) 
+        
+        for document in self.data_tags:
+            for curr, next_word in pairwise(document):
+                if self.smoothing_method == LAPLACE:
+                    bigrams[self.tag2idx[curr], self.tag2idx[next_word]] += 1 / (LAPLACE_FACTOR + self.unigrams[self.tag2idx[curr]] * self.num_words)
+                else: 
+                    bigrams[self.tag2idx[curr], self.tag2idx[next_word]] += 1 / (self.unigrams[self.tag2idx[curr]] * self.num_words)
+        
+        if self.smoothing_method == LAPLACE:
+            for i in range(len(bigrams)):
+                num_log = np.log(LAPLACE_FACTOR) - np.log(len(self.all_tags))
+                denom_log = np.log(self.unigrams[i] * self.num_words + LAPLACE_FACTOR)
+                bigrams[i] += np.exp(num_log - denom_log)
+        elif self.smoothing_method == INTERPOLATION:
+            lambda_1, lambda_2 = BIGRAM_LAMBDAS
+            for i in range(len(bigrams)):
+                for j in range(len(bigrams[i])):
+                    bigrams[i,j] = lambda_1 * bigrams[i,j] + lambda_2 * self.unigrams[j]
+        
+        self.bigrams = bigrams
+    
+    def get_trigrams(self) -> None:
+        """Computes trigrams."""
+        if self.bigrams is None:
+            self.get_bigrams()
         trigrams = np.zeros((len(self.all_tags), len(self.all_tags), len(self.all_tags)))
-        for sentence in self.data[1]:
-            for i in range(len(sentence) - 2):
-                trigrams[self.tag2idx[sentence[i]], self.tag2idx[sentence[i + 1]], self.tag2idx[sentence[i + 2]]] += 1
-        return (trigrams + self.smoothing_factor) / (np.sum(trigrams, axis=2, keepdims=True) + self.smoothing_factor * len(self.all_tags))
+        bigram_denominators = np.zeros((len(self.all_tags), len(self.all_tags)))
+        
+        def triplewise(iterable):
+            """s -> (s0,s1,s2), (s1,s2,s3), (s2, s3, s4), ..."""
+            a, b, c = tee(iterable, 3)
+            next(b, None)
+            next(c, None)
+            next(c, None)
+            return zip(a, b, c) 
+        
+        for document in self.data_tags:
+            for curr, next_word, nextnext_word in triplewise(document):
+                if self.smoothing_method == LAPLACE:
+                    trigrams[self.tag2idx[curr], self.tag2idx[next_word], self.tag2idx[nextnext_word]] += 1 
+                    bigram_denominators[self.tag2idx[curr], self.tag2idx[next_word]] += 1
+                else: 
+                    trigrams[self.tag2idx[curr], self.tag2idx[next_word], self.tag2idx[nextnext_word]] += 1 / (self.bigrams[self.tag2idx[curr], self.tag2idx[next_word]] * self.unigrams[self.tag2idx[curr]] * self.num_words)
+        
+        if self.smoothing_method == LAPLACE:
+            trigrams = np.exp(np.log(trigrams + LAPLACE_FACTOR/len(self.all_tags)) - np.log(bigram_denominators[:,:,None] + LAPLACE_FACTOR))
+        elif self.smoothing_method == INTERPOLATION:
+            lambda_1, lambda_2, lambda_3 = TRIGRAM_LAMBDAS
+            for i in range(len(trigrams)):
+                for j in range(len(trigrams[i])):
+                    for k in range(len(trigrams[i,j])):
+                        trigrams[i,j,k] = lambda_1 * trigrams[i,j,k] + lambda_2 * self.bigrams[j,k] + lambda_3 * self.unigrams[k]
+        
+        self.trigrams = trigrams
 
-    def get_emissions(self):
+    def assign_unk(self, tok: str) -> str:
+        """Assign unknown word tokens"""
+        if any(char.isdigit() for char in tok):
+            return "--unk_digit--"
+        elif any(char in self.punct for char in tok):
+            return "--unk_punct--"
+        elif any(char.isupper() for char in tok):
+            return "--unk_upper--"
+        elif any(tok.endswith(suffix) for suffix in self.noun_suffix):
+            return "--unk_noun--"
+        elif any(tok.endswith(suffix) for suffix in self.verb_suffix):
+            return "--unk_verb--"
+        elif any(tok.endswith(suffix) for suffix in self.adj_suffix):
+            return "--unk_adj--"
+        elif any(tok.endswith(suffix) for suffix in self.adv_suffix):
+            return "--unk_adv--"
+        return "--unk--"
+
+    def get_emissions(self) -> None:
         """Computes emission probabilities."""
-        emissions = np.zeros((len(self.all_tags), len(self.word2idx)))
-        for sentence, tags in zip(self.data[0], self.data[1]):
-            for word, tag in zip(sentence, tags):
-                emissions[self.tag2idx[tag], self.word2idx.get(word, self.word2idx[self.unk_token])] += 1
-        return (emissions + self.smoothing_factor) / (np.sum(emissions, axis=1, keepdims=True) + self.smoothing_factor * len(self.word2idx))
+        lexical = np.zeros((len(self.all_tags), len(self.all_words)))
+        for document_words, document_tags in zip(self.data_words, self.data_tags):
+            for word, tag in zip(document_words, document_tags):
+                if word not in self.word2idx:
+                    unk_type = self.assign_unk(word)
+                    lexical[self.tag2idx[tag], self.word2idx[unk_type]] += 1
+                else:
+                    lexical[self.tag2idx[tag], self.word2idx[word]] += 1
 
-    def build_suffix_pos_mapping(self):
-        """Builds a mapping from suffixes to POS tag distributions."""
-        self.suffix2pos = {}
-        for sentence, tags in zip(self.data[0], self.data[1]):
-            for word, tag in zip(sentence, tags):
-                suffix = word[-3:] if len(word) > 3 else word
-                if suffix not in self.suffix2pos:
-                    self.suffix2pos[suffix] = np.zeros(len(self.all_tags))
-                self.suffix2pos[suffix][self.tag2idx[tag]] += 1
-        for suffix in self.suffix2pos:
-            self.suffix2pos[suffix] = (self.suffix2pos[suffix] + EPSILON) / (np.sum(self.suffix2pos[suffix]) + EPSILON)
+        # Apply smoothing and convert to probabilities
+        tag_counts = np.sum(lexical, axis=1, keepdims=True)
+        lexical = (lexical + 1) / (tag_counts + len(self.all_words))  # Add-one smoothing
+        self.lexical = lexical
 
-    def build_mlp_features(self, word):
-        """Generates features for the MLP model."""
-        features = [
-            len(word),
-            int(word[0].isupper()), 
-            int(any(char.isdigit() for char in word)),
-            self.get_suffix_index(word), 
-        ]
-        return features
-
-    def get_suffix_index(self, word):
-        """Gets the index of the suffix."""
-        suffix = word[-3:] if len(word) > 3 else word
-        return hash(suffix) % 1000  
-
-    def train_discriminative_model(self):
-        """Trains the MLP model using extracted features."""
-        features = []
-        labels = []
-        for sentence, tags in zip(self.data[0], self.data[1]):
-            for word, tag in zip(sentence, tags):
-                features.append(self.build_mlp_features(word))
-                labels.append(self.tag2idx[tag])
-        self.mlp.fit(features, labels)
-
-    def predict_pos_with_mlp(self, word):
-        """Predicts the POS tag for a word using the MLP model."""
-        features = self.build_mlp_features(word)
-        probabilities = self.mlp.predict_proba([features])[0]
-        return probabilities 
-
-    def train(self, data):
+    def train(self, data: Tuple[List[List[str]], List[List[str]]], ngram: int = 2) -> None:
         """Trains the model by computing transition and emission probabilities."""
         self.data = data
-        self.all_tags = list(set([t for tag in data[1] for t in tag]))
-        self.tag2idx = {self.all_tags[i]: i for i in range(len(self.all_tags))}
-        self.idx2tag = {v: k for k, v in self.tag2idx.items()}
+        self.data_words: List[List[str]] = data[0]
+        self.data_tags: List[List[str]] = data[1]
+        self.all_tags = list(set(tag for sent_tags in data[1] for tag in sent_tags))
+        self.tag2idx: Dict[str, int] = {tag: i for i, tag in enumerate(self.all_tags)}
+        self.idx2tag: Dict[int, str] = {i: tag for tag, i in self.tag2idx.items()}
 
-        # Create the vocabulary and add <UNK> for unknown words
-        all_words = set([w for sentence in data[0] for w in sentence])
-        all_words.add(self.unk_token)
-        self.word2idx = {word: idx for idx, word in enumerate(all_words)}
-        self.idx2word = {v: k for k, v in self.word2idx.items()}
+        # Add unknown word types to vocabulary
+        unk_types = ["--unk--", "--unk_digit--", "--unk_punct--", "--unk_upper--", 
+                     "--unk_noun--", "--unk_verb--", "--unk_adj--", "--unk_adv--"]
+        self.all_words = list(set(word for sentence in self.data_words for word in sentence) | set(unk_types))
+        self.word2idx: Dict[str, int] = {word: i for i, word in enumerate(self.all_words)}
+        self.idx2word: Dict[int, str] = {i: word for word, i in self.word2idx.items()}
+        self.num_words = sum(len(d) for d in self.data_words)
+        self.ngram = ngram
 
-        self.unigrams = self.get_unigrams()
-        self.bigrams = self.get_bigrams()
-        self.trigrams = self.get_trigrams()
-        self.emissions = self.get_emissions()
-        self.build_suffix_pos_mapping() 
-        self.train_discriminative_model() 
+        self.get_trigrams()
+        self.get_unigrams_words()
+        self.get_emissions()
 
-    def get_wordnet_pos(self, word):
-        """Gets the POS tag from WordNet if available."""
-        synsets = wn.synsets(word)
-        if synsets:
-            wordnet_pos = synsets[0].pos()
-            return self.wordnet_pos_mapping.get(wordnet_pos, None)
-        return None
-
-    def get_suffix_pos_probability(self, word):
-        """Gets the POS tag distribution based on the word's suffix."""
-        suffix = word[-3:] if len(word) > 3 else word
-        if suffix in self.suffix2pos:
-            return self.suffix2pos[suffix]
-        else:
-            return np.ones(len(self.all_tags)) / len(self.all_tags)
-
-    def handle_unknown_word(self, word):
-        """Handles unknown words by combining suffix-based probabilities and MLP predictions."""
-        suffix_pos_prob = self.get_suffix_pos_probability(word)
-        mlp_pos_prob = self.predict_pos_with_mlp(word)
-
-        combined_prob = (suffix_pos_prob + mlp_pos_prob) / 2
-        return combined_prob  
-
-    def sequence_probability(self, sequence, tags):
+    def sequence_probability(self, sequence: List[str], tags: List[str]) -> float:
         """Computes the probability of a tagged sequence given the emission/transition probabilities."""
-        prob = 1.0
-        for i in range(len(sequence)):
-            word = sequence[i]
-            tag = tags[i]
-            tag_idx = self.tag2idx[tag]
-            word_idx = self.word2idx.get(word, self.word2idx[self.unk_token])
+        if self.trigrams is None:
+            self.get_trigrams()
+        if self.lexical is None:
+            self.get_emissions()
+        log_probability = 0.0
+        prev_prev_tag = None
+        prev_tag = None
+        for tag, word in zip(tags, sequence):
+            if word not in self.word2idx:
+                word = self.assign_unk(word)
+            log_probability += np.log(self.lexical[self.tag2idx[tag], self.word2idx[word]])
+            if self.ngram == 1:
+                log_probability += np.log(self.unigrams[self.tag2idx[tag]])
+            elif self.ngram == 2:
+                if prev_tag is not None:
+                    log_probability += np.log(self.bigrams[self.tag2idx[prev_tag], self.tag2idx[tag]])
+            else: 
+                if prev_prev_tag is not None and prev_tag is not None:
+                    log_probability += np.log(self.trigrams[self.tag2idx[prev_prev_tag], self.tag2idx[prev_tag], self.tag2idx[tag]])
+                elif prev_tag is not None:
+                    log_probability += np.log(self.bigrams[self.tag2idx[prev_tag], self.tag2idx[tag]])
+            prev_prev_tag = prev_tag
+            prev_tag = tag
+        return np.exp(log_probability)
+    def get_greedy_best_tag(self, word: str, prev_tag: str, prev_prev_tag: str) -> Tuple[str, str, str]:
+        best_tag = None
+        if self.ngram == 1:
+            best_tag = self.idx2tag[np.argmax(self.lexical[:, self.word2idx[word]] * self.unigrams)]
+        elif self.ngram == 2:
+            if prev_tag is None:
+                best_tag = 'O'
+            else:
+                best_tag_index = np.argmax(self.lexical[:, self.word2idx[word]] * self.bigrams[self.tag2idx[prev_tag], :])
+                best_tag = self.idx2tag[best_tag_index]
+            prev_tag = best_tag
+        elif self.ngram == 3:
+            if prev_tag is None: 
+                best_tag = 'O'
+            elif prev_prev_tag is None:
+                best_tag_index = np.argmax(self.lexical[:, self.word2idx[word]] * self.bigrams[self.tag2idx[prev_tag], :]) 
+                best_tag = self.idx2tag[best_tag_index]
+            else: 
+                best_tag_index = np.argmax(self.lexical[:, self.word2idx[word]] * self.trigrams[self.tag2idx[prev_prev_tag], self.tag2idx[prev_tag], :])
+                best_tag = self.idx2tag[best_tag_index]
+            prev_prev_tag = prev_tag
+            prev_tag = best_tag
+        return best_tag, prev_tag, prev_prev_tag
+
+    def greedy(self, sequence: List[str]) -> List[str]:
+        """Decodes the most likely sequence using greedy decoding."""
+        if self.lexical is None:
+            self.get_emissions()
+        if self.trigrams is None:
+            self.get_trigrams()
+        prev_prev_tag = None
+        prev_tag = None
+        result = []
+        for word in sequence:
+            if word not in self.word2idx:
+                word = self.assign_unk(word)
+            best_tag, prev_tag, prev_prev_tag = self.get_greedy_best_tag(word, prev_tag, prev_prev_tag)
+            result.append(best_tag)
+        return result
+    def get_beam_search_best_tag(self, word: str, prev_tag: str, prev_prev_tag: str) -> List[str]:
+        best_tags = []
+        if self.ngram == 1:
+            best_tag_indices = np.argsort(self.lexical[:, self.word2idx[word]] * self.bigrams[self.tag2idx[prev_tag], :])[-BEAM_K:]
+            best_tags = [self.idx2tag[index] for index in best_tag_indices]
+        elif self.ngram == 2:
+            if prev_tag is None:
+                best_tags = ['O'] * BEAM_K
+            else:
+                best_tag_indices = np.argsort(self.lexical[:, self.word2idx[word]] * self.bigrams[self.tag2idx[prev_tag], :])[-BEAM_K:]
+                best_tags = [self.idx2tag[index] for index in best_tag_indices]
+        elif self.ngram == 3:
+            if prev_tag is None: 
+                best_tags = ['O'] * BEAM_K
+            elif prev_prev_tag is None:
+                best_tag_indices = np.argsort(self.lexical[:, self.word2idx[word]] * self.bigrams[self.tag2idx[prev_tag], :])[-BEAM_K:]
+                best_tags = [self.idx2tag[index] for index in best_tag_indices]
+            else: 
+                best_tag_indices = np.argsort(self.lexical[:, self.word2idx[word]] * self.trigrams[self.tag2idx[prev_prev_tag], self.tag2idx[prev_tag], :])[-BEAM_K:]
+                best_tags = [self.idx2tag[index] for index in best_tag_indices]
+        return best_tags
+    
+    def beam_search(self, sequence: List[str]) -> List[str]:
+        """Decodes the most likely sequence using beam-search or top-k greedy search."""
+        if self.lexical is None:
+            self.get_emissions()
+        if self.trigrams is None:
+            self.get_trigrams()     
+        k_results: List[List[str]] = [[] for _ in range(BEAM_K)]
+        k_square_temp: List[List[str]] = []
+        for i, word in enumerate(sequence):
+            if word not in self.word2idx:
+                word = self.assign_unk(word)
             if i == 0:
-                prob *= self.unigrams[tag_idx]
-            elif i == 1:
-                prev_tag_idx = self.tag2idx[tags[i - 1]]
-                prob *= self.bigrams[prev_tag_idx, tag_idx]
+                best_tags = self.get_beam_search_best_tag(word, None, None)
+                k_results = [[tag] for tag in best_tags]
             else:
-                prev_prev_tag_idx = self.tag2idx[tags[i - 2]]
-                prev_tag_idx = self.tag2idx[tags[i - 1]]
-                prob *= self.trigrams[prev_prev_tag_idx, prev_tag_idx, tag_idx]
-            if word in self.word2idx:
-                prob *= self.emissions[tag_idx, word_idx]
-            else:
-                unk_emission_prob = self.handle_unknown_word(word)
-                prob *= unk_emission_prob[tag_idx]
-        return prob
+                for result in k_results:
+                    prev_tag = result[-1] if len(result) >= 1 else None
+                    prev_prev_tag = result[-2] if len(result) >= 2 else None
+                    best_tags = self.get_beam_search_best_tag(word, prev_tag, prev_prev_tag)
+                    for tag in best_tags:
+                        k_square_temp.append(result + [tag])
+                k_square_temp_with_pr = [(x, self.sequence_probability(sequence[:i+1], x)) for x in k_square_temp]
+                k_square_temp_with_pr.sort(key=lambda x: x[1], reverse=True)
+                k_results = [x[0] for x in k_square_temp_with_pr[:BEAM_K]]
+                k_square_temp = []
+        return k_results[0]
 
-    def inference(self, sequence):
-        """Tags a sequence with part of speech tags."""
-        if INFERENCE == GREEDY:
-            return self.greedy_decode(sequence)
-        elif INFERENCE == BEAM:
-            return self.beam_search(sequence, k=BEAM_K)
-        elif INFERENCE == VITERBI:
-            return self.viterbi_decode(sequence)
-        return None
-
-    def viterbi_decode(self, sequence):
-        """Performs Viterbi decoding."""
-        sequence = self.preprocess(sequence)
-        V = [{}]
-        path = {}
-
-        # Initialize base cases (t == 0)
-        for tag in self.all_tags:
-            tag_idx = self.tag2idx[tag]
-            word = sequence[0]
-            if word in self.word2idx:
-                emission_prob = self.emissions[tag_idx, self.word2idx[word]]
-            else:
-                emission_prob = self.handle_unknown_word(word)[tag_idx]
-            V[0][tag] = self.unigrams[tag_idx] * emission_prob
-            path[tag] = [tag]
-
-        # Run Viterbi for t > 0
-        for t in range(1, len(sequence)):
-            V.append({})
-            newpath = {}
-            word = sequence[t]
-            if word in self.word2idx:
-                emission_probs = self.emissions[:, self.word2idx[word]]
-            else:
-                emission_probs = self.handle_unknown_word(word)
+    def viterbi_bigram(self, sequence: List[str]) -> List[str]:
+        result = [None for _ in range(len(sequence))]
+        pis = np.full((len(self.all_tags), len(sequence)), -np.inf)
+        bps = np.full((len(self.all_tags), len(sequence)), None)
+        # initialize first column
+        pis[self.tag2idx['O'], 0] = 0
+        for i in range(1, len(sequence)):
+            word = sequence[i]
+            if word not in self.word2idx:
+                word = self.assign_unk(word)
             for tag in self.all_tags:
                 tag_idx = self.tag2idx[tag]
-                (prob, prev_tag) = max(
-                    (V[t - 1][ptag] * self.bigrams[self.tag2idx[ptag], tag_idx] * emission_probs[tag_idx], ptag)
-                    for ptag in self.all_tags
-                )
-                V[t][tag] = prob
-                newpath[tag] = path[prev_tag] + [tag]
-            path = newpath
+                emission = self.lexical[tag_idx, self.word2idx[word]]
+                best_prev_tag = np.argmax(pis[:,i-1] + np.log(self.bigrams[:,tag_idx]))
+                best_pi = np.max(pis[:,i-1] + np.log(self.bigrams[:,tag_idx]))
+                pis[tag_idx, i] = np.log(emission) + best_pi
+                bps[tag_idx, i] = best_prev_tag
+        best_final_tag_idx = np.argmax(pis[:,len(sequence)-1])
+        result[len(sequence)-1] = self.idx2tag[best_final_tag_idx]
+        best_prev_tag_idx = int(bps[best_final_tag_idx, len(sequence)-1])
+        for i in range(len(sequence)-2, 0, -1):
+            result[i] = self.idx2tag[best_prev_tag_idx]
+            best_prev_tag_idx = int(bps[best_prev_tag_idx,i])
+        result[0] = self.idx2tag[best_prev_tag_idx]
+        return result
 
-        # Find the final most probable tag sequence
-        n = len(sequence) - 1
-        (prob, state) = max((V[n][tag], tag) for tag in self.all_tags)
-        return path[state]
+    def viterbi_trigram(self, sequence: List[str]) -> List[str]:
+        NUM_TAGS = len(self.all_tags)
+        result = [None for _ in range(len(sequence))]
+        pis = np.full((NUM_TAGS * NUM_TAGS, len(sequence)), -np.inf)
+        bps = np.full((NUM_TAGS * NUM_TAGS, len(sequence)), -np.inf)
+        doc_start_index = self.tag2idx['O']
+        pis[doc_start_index * NUM_TAGS:doc_start_index * (NUM_TAGS + 1), 0] = 0
+        for i in range(1, len(sequence)):
+            word = sequence[i]
+            if word not in self.word2idx:
+                word = self.assign_unk(word)
+            for tag in self.all_tags:
+                tag_idx = self.tag2idx[tag]
+                emission = self.lexical[tag_idx, self.word2idx[word]]
+                log_emission = np.log(emission)
+                for prev_tag in self.all_tags:
+                    prev_tag_idx = self.tag2idx[prev_tag]
+                    entry_idx = prev_tag_idx * NUM_TAGS + tag_idx
+                    best_pi = np.max(pis[prev_tag_idx::NUM_TAGS,i-1] + np.log(self.trigrams[:, prev_tag_idx,tag_idx]))
+                    best_prev_tag = np.argmax(pis[prev_tag_idx::NUM_TAGS,i-1] + np.log(self.trigrams[:, prev_tag_idx,tag_idx]))
+                    pis[entry_idx, i] = log_emission + best_pi
+                    bps[entry_idx, i] = best_prev_tag
+        last_tag = None
+        second_last_tag = None
+        max_pi = -np.inf
+        for i in range(NUM_TAGS):
+            pi = np.max(pis[i::NUM_TAGS, len(sequence)-1] + self.trigrams[:, i, self.tag2idx['.']])
+            entry = np.argmax(pis[i::NUM_TAGS, len(sequence)-1] + self.trigrams[:, i, self.tag2idx['.']])
+            if pi > max_pi:
+                max_pi = pi
+                last_tag = self.idx2tag[i]
+                second_last_tag = self.idx2tag[entry]
+        result[len(sequence)-1] = last_tag
+        result[len(sequence)-2] = second_last_tag
+        for i in range(len(sequence)-3, 0, -1):
+            best_prev_tag_idx = int(bps[self.tag2idx[result[i+2]] + NUM_TAGS * self.tag2idx[result[i+1]],i+2])
+            result[i] = self.idx2tag[best_prev_tag_idx]
+        result[0] = self.idx2tag[doc_start_index]
+        return result
 
-    def greedy_decode(self, sequence):
-        """Performs greedy decoding."""
-        sequence = self.preprocess(sequence)
-        tags = []
-        for word in sequence:
-            if word in self.word2idx:
-                emission_probs = self.emissions[:, self.word2idx[word]]
-            else:
-                emission_probs = self.handle_unknown_word(word)
-            best_tag_idx = np.argmax(emission_probs)
-            best_tag = self.idx2tag[best_tag_idx]
-            tags.append(best_tag)
-        return tags
+    def viterbi(self, sequence: List[str]) -> List[str]:
+        if self.lexical is None:
+            self.get_emissions()
+        if self.trigrams is None:
+            self.get_trigrams()
+        if self.ngram == 2: 
+            return self.viterbi_bigram(sequence)
+        elif self.ngram == 3:
+            return self.viterbi_trigram(sequence)
 
-    def beam_search(self, sequence, k=3):
-        """Performs beam search decoding."""
-        pass
-
-
-
-
+    def inference(self, sequence: List[str]) -> List[str]:
+        """Tags a sequence with part of speech tags."""
+        if self.inference_method == GREEDY:
+            return self.greedy(sequence)
+        elif self.inference_method == BEAM:
+            return self.beam_search(sequence)
+        elif self.inference_method == VITERBI:
+            return self.viterbi(sequence)
+        else:
+            raise ValueError(f"Unknown inference method: {self.inference_method}")
 if __name__ == "__main__":
-    pos_tagger = POSTagger()
+    pos_tagger = POSTagger(VITERBI, smoothing_method=INTERPOLATION)
 
     train_data = load_data("data/train_x.csv", "data/train_y.csv")
     dev_data = load_data("data/dev_x.csv", "data/dev_y.csv")
     test_data = load_data("data/test_x.csv")
-    INFERENCE = VITERBI
-    SMOOTHING = LAPLACE 
-    CAPITALIZATION = False  
-    TNT_UNK = True  
-    pos_tagger.train(train_data)
 
-    # Use the evaluate function to evaluate the model
+    pos_tagger.train(train_data, ngram=3)
+
+    # Experiment with your decoder using greedy decoding, beam search, viterbi...
+
+    # Here you can also implement experiments that compare different styles of decoding,
+    # smoothing, n-grams, etc.
     evaluate(dev_data, pos_tagger)
 
     # Predict tags for the test set
     test_predictions = []
     for sentence in test_data:
         test_predictions.extend(pos_tagger.inference(sentence))
-
-    # TODO: Save predictions to file to update the leaderboard
+    
+    # Write them to a file to update the leaderboard
+    # Write them to a file to update the leaderboard
+    with open('test_y.csv', mode='w', newline='') as file:
+        writer = csv.writer(file)
+        # Optionally write a header
+        writer.writerow(["id","predicted_tag"])
+        for i, tag in enumerate(test_predictions):
+            writer.writerow([i,tag])
