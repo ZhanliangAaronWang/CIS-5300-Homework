@@ -84,9 +84,10 @@ class POSTagger:
         self.smoothing_method = smoothing_method
         self.inference_method = inference_method
         self.discount = 0.75 
-        self.uni, self.bi, self.tri = None, None, None
+        self.uni, self.bi, self.tri, self.quad = None, None, None, None
         self.lex = None
         self.n_gram = None
+        self.BEAM_K = BEAM_K
         self.vocab_size = -1
         self.punct_set = frozenset(string.punctuation)
         self.suffix_dict = {
@@ -154,7 +155,60 @@ class POSTagger:
         bi = bi / row_sums[:, np.newaxis]
         
         self.bi = bi
+    def get_quadgrams(self) -> None:
+        if self.tri is None:
+            self.get_trigrams()
         
+        quad = np.zeros((len(self.tag_set), len(self.tag_set), len(self.tag_set), len(self.tag_set)))
+        
+        if self.smoothing_method == "kneser_ney":
+            trigram_counts = np.zeros((len(self.tag_set), len(self.tag_set), len(self.tag_set)))
+            continuation_counts = np.zeros((len(self.tag_set), len(self.tag_set), len(self.tag_set)))
+        elif self.smoothing_method == LAPLACE:
+            tri_denoms = np.zeros((len(self.tag_set), len(self.tag_set), len(self.tag_set)))
+        
+        for doc in self.tag_data:
+            for t1, t2, t3, t4 in zip(doc, doc[1:], doc[2:], doc[3:]):
+                idx1, idx2, idx3, idx4 = self.tag2idx[t1], self.tag2idx[t2], self.tag2idx[t3], self.tag2idx[t4]
+                if self.smoothing_method == "kneser_ney":
+                    quad[idx1, idx2, idx3, idx4] += 1
+                    trigram_counts[idx1, idx2, idx3] += 1
+                    continuation_counts[idx2, idx3, idx4] += 1
+                elif self.smoothing_method == LAPLACE:
+                    quad[idx1, idx2, idx3, idx4] += 1 
+                    tri_denoms[idx1, idx2, idx3] += 1
+                else: 
+                    quad[idx1, idx2, idx3, idx4] += 1 / (self.tri[idx1, idx2, idx3] * self.bi[idx1, idx2] * self.uni[idx1] * self.vocab_size)
+        
+        if self.smoothing_method == "kneser_ney":
+            discount = 0.75
+            for i in range(len(self.tag_set)):
+                for j in range(len(self.tag_set)):
+                    for k in range(len(self.tag_set)):
+                        if trigram_counts[i, j, k] > 0:
+                            normalization = np.sum(continuation_counts[j, k, :])
+                            for l in range(len(self.tag_set)):
+                                quad[i, j, k, l] = max(quad[i, j, k, l] - discount, 0) / trigram_counts[i, j, k]
+                                if normalization > 0:
+                                    quad[i, j, k, l] += (discount / trigram_counts[i, j, k]) * (continuation_counts[j, k, l] / normalization)
+        elif self.smoothing_method == LAPLACE:
+            quad = np.exp(np.log(self.epsilon + quad + LAPLACE_FACTOR/len(self.tag_set)) - np.log(self.epsilon + tri_denoms[:,:,:,None] + LAPLACE_FACTOR))
+        elif self.smoothing_method == INTERPOLATION:
+            lambda_1, lambda_2, lambda_3, lambda_4 = QUADGRAM_LAMBDAS  # You need to define this
+            for i in range(len(quad)):
+                for j in range(len(quad[i])):
+                    for k in range(len(quad[i, j])):
+                        quad[i,j,k] = lambda_1 * quad[i,j,k] + lambda_2 * self.tri[j,k] + lambda_3 * self.bi[k] + lambda_4 * self.uni
+        
+        # Normalize
+        for i in range(len(self.tag_set)):
+            for j in range(len(self.tag_set)):
+                for k in range(len(self.tag_set)):
+                    row_sum = np.sum(quad[i, j, k, :])
+                    if row_sum > 0:
+                        quad[i, j, k, :] /= row_sum
+        
+        self.quad = quad
     def get_trigrams(self) -> None:
         if self.bi is None:
             self.get_bigrams()
@@ -251,17 +305,22 @@ class POSTagger:
         self.vocab_size = sum(len(d) for d in self.word_data)
         self.n_gram = ngram
 
-        self.get_trigrams()
+        if self.n_gram == 4:
+            self.get_quadgrams()
+        else:
+            self.get_trigrams()
         self.get_unigrams_words()
         self.get_emissions()
 
     def sequence_probability(self, sequence: List[str], tags: List[str]) -> float:
-        if self.tri is None:
+        if self.quad is None and self.n_gram == 4:
+            self.get_quadgrams()
+        elif self.tri is None:
             self.get_trigrams()
         if self.lex is None:
             self.get_emissions()
         log_prob = 0.0
-        prev2, prev1 = None, None
+        prev3, prev2, prev1 = None, None, None
         for tag, word in zip(tags, sequence):
             word = self.assign_unk(word) if word not in self.word2idx else word
             log_prob += np.log(self.epsilon+self.lex[self.tag2idx[tag], self.word2idx[word]])
@@ -271,10 +330,12 @@ class POSTagger:
                 log_prob += np.log(self.epsilon+self.bi[self.tag2idx[prev1], self.tag2idx[tag]])
             elif self.n_gram == 3 and prev2 and prev1:
                 log_prob += np.log(self.epsilon+self.tri[self.tag2idx[prev2], self.tag2idx[prev1], self.tag2idx[tag]])
-            prev2, prev1 = prev1, tag
+            elif self.n_gram == 4 and prev3 and prev2 and prev1:
+                log_prob += np.log(self.epsilon+self.quad[self.tag2idx[prev3], self.tag2idx[prev2], self.tag2idx[prev1], self.tag2idx[tag]])
+            prev3, prev2, prev1 = prev2, prev1, tag
         return np.exp(log_prob)
 
-    def get_greedy_best_tag(self, word: str, prev_tag: str, prev_prev_tag: str) -> Tuple[str, str, str]:
+    def get_greedy_best_tag(self, word: str, prev_tag: str, prev_prev_tag: str, prev_prev_prev_tag: str) -> Tuple[str, str, str, str]:
         word_idx = self.word2idx[self.assign_unk(word)] if word not in self.word2idx else self.word2idx[word]
         if self.n_gram == 1:
             best_tag = self.idx2tag[np.argmax(self.lex[:, word_idx] * self.uni)]
@@ -292,61 +353,105 @@ class POSTagger:
             else: 
                 best_tag = self.idx2tag[np.argmax(self.lex[:, word_idx] * self.tri[self.tag2idx[prev_prev_tag], self.tag2idx[prev_tag], :])]
             prev_prev_tag, prev_tag = prev_tag, best_tag
-        return best_tag, prev_tag, prev_prev_tag
+        elif self.n_gram == 4:
+            if prev_tag is None:
+                best_tag = 'O'
+            elif prev_prev_tag is None:
+                best_tag = self.idx2tag[np.argmax(self.lex[:, word_idx] * self.bi[self.tag2idx[prev_tag], :])]
+            elif prev_prev_prev_tag is None:
+                best_tag = self.idx2tag[np.argmax(self.lex[:, word_idx] * self.tri[self.tag2idx[prev_prev_tag], self.tag2idx[prev_tag], :])]
+            else:
+                best_tag = self.idx2tag[np.argmax(self.lex[:, word_idx] * self.quad[self.tag2idx[prev_prev_prev_tag], self.tag2idx[prev_prev_tag], self.tag2idx[prev_tag], :])]
+            prev_prev_prev_tag, prev_prev_tag, prev_tag = prev_prev_tag, prev_tag, best_tag
+        return best_tag, prev_tag, prev_prev_tag, prev_prev_prev_tag
 
     def greedy(self, sequence: List[str]) -> List[str]:
-        if self.lex is None or self.tri is None:
+        if self.lex is None or (self.tri is None and self.n_gram >= 3) or (self.quad is None and self.n_gram == 4):
             self.get_emissions()
-            self.get_trigrams()
-        prev2 = prev1 = None
+            if self.n_gram == 4:
+                self.get_quadgrams()
+            else:
+                self.get_trigrams()
+        prev3 = prev2 = prev1 = None
         result = []
         for word in sequence:
-            best_tag, prev1, prev2 = self.get_greedy_best_tag(word, prev1, prev2)
+            best_tag, prev1, prev2, prev3 = self.get_greedy_best_tag(word, prev1, prev2, prev3)
             result.append(best_tag)
         return result
-
-    def get_beam_search_best_tag(self, word: str, prev_tag: str, prev_prev_tag: str) -> List[str]:
+    def get_beam_search_best_tag(self, word: str, prev_tag: str, prev_prev_tag: str, prev_prev_prev_tag: str) -> List[Tuple[str, float]]:
         word_idx = self.word2idx[self.assign_unk(word)] if word not in self.word2idx else self.word2idx[word]
+        
         if self.n_gram == 1:
-            scores = self.lex[:, word_idx] * self.bi[self.tag2idx[prev_tag], :]
+            scores = np.log(self.lex[:, word_idx] + self.epsilon)
         elif self.n_gram == 2:
             if prev_tag is None:
-                return ['O'] * BEAM_K
-            scores = self.lex[:, word_idx] * self.bi[self.tag2idx[prev_tag], :]
+                scores = np.log(self.lex[:, word_idx] + self.epsilon)
+            else:
+                scores = np.log(self.lex[:, word_idx] + self.epsilon) + np.log(self.bi[self.tag2idx[prev_tag], :] + self.epsilon)
         elif self.n_gram == 3:
             if prev_tag is None:
-                return ['O'] * BEAM_K
+                scores = np.log(self.lex[:, word_idx] + self.epsilon)
             elif prev_prev_tag is None:
-                scores = self.lex[:, word_idx] * self.bi[self.tag2idx[prev_tag], :]
-            else: 
-                scores = self.lex[:, word_idx] * self.tri[self.tag2idx[prev_prev_tag], self.tag2idx[prev_tag], :]
-        return [self.idx2tag[idx] for idx in np.argsort(scores)[-BEAM_K:]]
-    
+                scores = np.log(self.lex[:, word_idx] + self.epsilon) + np.log(self.bi[self.tag2idx[prev_tag], :] + self.epsilon)
+            else:
+                scores = np.log(self.lex[:, word_idx] + self.epsilon) + np.log(self.tri[self.tag2idx[prev_prev_tag], self.tag2idx[prev_tag], :] + self.epsilon)
+        elif self.n_gram == 4:
+            if prev_tag is None:
+                scores = np.log(self.lex[:, word_idx] + self.epsilon)
+            elif prev_prev_tag is None:
+                scores = np.log(self.lex[:, word_idx] + self.epsilon) + np.log(self.bi[self.tag2idx[prev_tag], :] + self.epsilon)
+            elif prev_prev_prev_tag is None:
+                scores = np.log(self.lex[:, word_idx] + self.epsilon) + np.log(self.tri[self.tag2idx[prev_prev_tag], self.tag2idx[prev_tag], :] + self.epsilon)
+            else:
+                scores = np.log(self.lex[:, word_idx] + self.epsilon) + np.log(self.quad[self.tag2idx[prev_prev_prev_tag], self.tag2idx[prev_prev_tag], self.tag2idx[prev_tag], :] + self.epsilon)
+        
+        best_tag_indices = np.argsort(scores)[-self.BEAM_K:]
+        return [(self.idx2tag[idx], scores[idx]) for idx in best_tag_indices]
     def beam_search(self, sequence: List[str]) -> List[str]:
-        if self.lex is None or self.tri is None:
+        if self.lex is None or (self.tri is None and self.n_gram >= 3) or (self.quad is None and self.n_gram == 4):
             self.get_emissions()
-            self.get_trigrams()
-        beam = [(['O'], 0.0)]
+            if self.n_gram == 4:
+                self.get_quadgrams()
+            else:
+                self.get_trigrams()
+        
+        beam = [([], 0.0)]
+        
         for i, word in enumerate(sequence):
             word = self.assign_unk(word) if word not in self.word2idx else word
             new_beam = []
+            
             for tags, score in beam:
                 prev1 = tags[-1] if len(tags) >= 1 else None
                 prev2 = tags[-2] if len(tags) >= 2 else None
-                for tag in self.get_beam_search_best_tag(word, prev1, prev2):
+                prev3 = tags[-3] if len(tags) >= 3 else None
+                
+                best_k_tags = self.get_beam_search_best_tag(word, prev1, prev2, prev3)
+                
+                for tag, tag_score in best_k_tags:
                     new_tags = tags + [tag]
-                    new_score = score + np.log(self.epsilon+self.sequence_probability(sequence[:i+1], new_tags))
+                    new_score = score + tag_score 
                     new_beam.append((new_tags, new_score))
-            beam = sorted(new_beam, key=lambda x: x[1], reverse=True)[:BEAM_K]
+            
+            beam = sorted(new_beam, key=lambda x: x[1], reverse=True)[:self.BEAM_K]
+        
         return beam[0][0]
-
     def viterbi(self, sequence: List[str]) -> List[str]:
         if self.lex is None:
             self.get_emissions()
-        if self.tri is None:
+        if self.n_gram == 4 and self.quad is None:
+            self.get_quadgrams()
+        elif self.tri is None:
             self.get_trigrams()
-        return self.viterbi_bigram(sequence) if self.n_gram == 2 else self.viterbi_trigram(sequence)
-
+        
+        if self.n_gram == 2:
+            return self.viterbi_bigram(sequence)
+        elif self.n_gram == 3:
+            return self.viterbi_trigram(sequence)
+        elif self.n_gram == 4:
+            return self.viterbi_quadgram(sequence)
+        else:
+            raise ValueError(f"Unsupported n-gram: {self.n_gram}")
     def viterbi_bigram(self, sequence: List[str]) -> List[str]:
         V = [{}]
         path = {}
@@ -402,7 +507,47 @@ class POSTagger:
         
         (prob, state) = max((V[len(sequence) - 1][y], y) for y in self.tag_set)
         return path[state]
-
+    def viterbi_quadgram(self, sequence: List[str]) -> List[str]:
+        V = [{} for _ in range(len(sequence))]
+        path = {}
+        
+        # Initialize
+        word = self.assign_unk(sequence[0]) if sequence[0] not in self.word2idx else sequence[0]
+        for tag in self.tag_set:
+            V[0][tag] = np.log(self.epsilon + self.uni[self.tag2idx[tag]]) + np.log(self.epsilon + self.lex[self.tag2idx[tag], self.word2idx[word]])
+            path[tag] = [tag]
+        
+        # Run Viterbi for t > 0
+        for t in range(1, len(sequence)):
+            newpath = {}
+            word = self.assign_unk(sequence[t]) if sequence[t] not in self.word2idx else sequence[t]
+            word_idx = self.word2idx[word]
+            
+            for tag in self.tag_set:
+                if t == 1:
+                    (prob, state) = max(
+                        (V[t-1][y0] + np.log(self.epsilon + self.bi[self.tag2idx[y0], self.tag2idx[tag]]) + np.log(self.epsilon + self.lex[self.tag2idx[tag], word_idx]), y0)
+                        for y0 in self.tag_set
+                    )
+                elif t == 2:
+                    (prob, state) = max(
+                        (V[t-1][y1] + np.log(self.epsilon + self.tri[self.tag2idx[y0], self.tag2idx[y1], self.tag2idx[tag]]) + np.log(self.epsilon + self.lex[self.tag2idx[tag], word_idx]), y1)
+                        for y0 in self.tag_set for y1 in self.tag_set if y0 == path[y1][-2]
+                    )
+                else:
+                    (prob, state) = max(
+                        (V[t-1][y2] + np.log(self.epsilon + self.quad[self.tag2idx[y0], self.tag2idx[y1], self.tag2idx[y2], self.tag2idx[tag]]) + np.log(self.epsilon + self.lex[self.tag2idx[tag], word_idx]), y2)
+                        for y0 in self.tag_set for y1 in self.tag_set for y2 in self.tag_set 
+                        if y0 == path[y2][-3] and y1 == path[y2][-2]
+                    )
+                
+                V[t][tag] = prob
+                newpath[tag] = path[state] + [tag]
+            
+            path = newpath
+        
+        (prob, state) = max((V[len(sequence) - 1][y], y) for y in self.tag_set)
+        return path[state]
     def inference(self, sequence: List[str]) -> List[str]:
         method_map = {
             GREEDY: self.greedy,
@@ -414,13 +559,12 @@ class POSTagger:
         return method_map[self.inference_method](sequence)
 
 if __name__ == "__main__":
-    pos_tagger = POSTagger(VITERBI, smoothing_method=INTERPOLATION)
+    pos_tagger = POSTagger(VITERBI, smoothing_method="kneser_ney")
 
     train_data = load_data("data/train_x.csv", "data/train_y.csv")
     dev_data = load_data("data/dev_x.csv", "data/dev_y.csv")
     test_data = load_data("data/test_x.csv")
-    # train_data = tuple([a + b for a, b in zip(train_data, dev_data)])
-    pos_tagger.train(train_data, ngram=3, UNK_C=UNK_C, UNK_M=UNK_M)
+    pos_tagger.train(train_data, ngram=4, UNK_C=UNK_C, UNK_M=UNK_M)
 
     # Experiment with your decoder using greedy decoding, beam search, viterbi...
 
